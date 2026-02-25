@@ -305,15 +305,19 @@ impl ThreadEventStore {
 
     fn push_legacy_event(&mut self, event: Event) {
         if let Some(fingerprint) = Self::event_fingerprint(&event.msg) {
-            if self.event_fingerprints.contains(&fingerprint) {
+            // Only suppress duplicate synthetic events (empty id), which are
+            // produced by rollout polling for live sync. Keeping this scoped to
+            // synthetic events avoids hiding legitimate repeated live events.
+            if self.event_fingerprints.contains(&fingerprint) && event.id.is_empty() {
                 return;
             }
-            self.event_fingerprints.insert(fingerprint);
-            self.event_fingerprint_order.push_back(fingerprint);
-            if self.event_fingerprint_order.len() > EVENT_FINGERPRINT_CACHE_CAPACITY
-                && let Some(evicted) = self.event_fingerprint_order.pop_front()
-            {
-                self.event_fingerprints.remove(&evicted);
+            if self.event_fingerprints.insert(fingerprint) {
+                self.event_fingerprint_order.push_back(fingerprint);
+                if self.event_fingerprint_order.len() > EVENT_FINGERPRINT_CACHE_CAPACITY
+                    && let Some(evicted) = self.event_fingerprint_order.pop_front()
+                {
+                    self.event_fingerprints.remove(&evicted);
+                }
             }
         }
 
@@ -335,7 +339,19 @@ impl ThreadEventStore {
 
     fn event_fingerprint(msg: &EventMsg) -> Option<u64> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        let encoded = serde_json::to_vec(msg).ok()?;
+        let encoded = match msg {
+            // Canonicalize optional image field so `images: null` and
+            // `images: []` hash the same (both render identically).
+            EventMsg::UserMessage(event) => serde_json::to_vec(&serde_json::json!({
+                "type": "user_message",
+                "message": event.message,
+                "images": event.images.clone().unwrap_or_default(),
+                "local_images": event.local_images,
+                "text_elements": event.text_elements,
+            }))
+            .ok()?,
+            _ => serde_json::to_vec(msg).ok()?,
+        };
         encoded.hash(&mut hasher);
         Some(hasher.finish())
     }
@@ -3326,6 +3342,48 @@ mod tests {
 
         store.push_event(duplicate.clone());
         store.push_event(duplicate);
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.events.len(), 1);
+    }
+
+    #[test]
+    fn thread_event_store_keeps_duplicate_live_events_with_distinct_ids() {
+        let mut store = ThreadEventStore::new(16);
+        store.push_event(Event {
+            id: "live-1".to_string(),
+            msg: EventMsg::SkillsUpdateAvailable,
+        });
+        store.push_event(Event {
+            id: "live-2".to_string(),
+            msg: EventMsg::SkillsUpdateAvailable,
+        });
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.events.len(), 2);
+    }
+
+    #[test]
+    fn thread_event_store_dedupes_user_message_none_vs_empty_images() {
+        let mut store = ThreadEventStore::new(16);
+        store.push_event(Event {
+            id: "live-user-message".to_string(),
+            msg: EventMsg::UserMessage(UserMessageEvent {
+                message: "hello".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            }),
+        });
+        store.push_event(Event {
+            id: String::new(),
+            msg: EventMsg::UserMessage(UserMessageEvent {
+                message: "hello".to_string(),
+                images: Some(Vec::new()),
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+            }),
+        });
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.events.len(), 1);
