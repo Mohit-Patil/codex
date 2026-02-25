@@ -253,7 +253,9 @@ struct ThreadEventStore {
     session_configured: Option<Event>,
     buffer: VecDeque<Event>,
     user_message_ids: HashSet<String>,
-    event_fingerprints: HashSet<u64>,
+    /// Maps event fingerprint -> whether a synthetic (rollout-polled, empty-id)
+    /// copy has been observed for this fingerprint.
+    event_fingerprints: HashMap<u64, bool>,
     event_fingerprint_order: VecDeque<u64>,
     capacity: usize,
     active: bool,
@@ -265,7 +267,7 @@ impl ThreadEventStore {
             session_configured: None,
             buffer: VecDeque::new(),
             user_message_ids: HashSet::new(),
-            event_fingerprints: HashSet::new(),
+            event_fingerprints: HashMap::new(),
             event_fingerprint_order: VecDeque::new(),
             capacity,
             active: false,
@@ -305,13 +307,21 @@ impl ThreadEventStore {
 
     fn push_legacy_event(&mut self, event: Event) {
         if let Some(fingerprint) = Self::event_fingerprint(&event.msg) {
-            // Only suppress duplicate synthetic events (empty id), which are
-            // produced by rollout polling for live sync. Keeping this scoped to
-            // synthetic events avoids hiding legitimate repeated live events.
-            if self.event_fingerprints.contains(&fingerprint) && event.id.is_empty() {
-                return;
-            }
-            if self.event_fingerprints.insert(fingerprint) {
+            let is_synthetic = event.id.is_empty();
+            if let Some(seen_synthetic) = self.event_fingerprints.get_mut(&fingerprint) {
+                // Treat live+synthetic pairs as the same logical event, regardless
+                // of arrival order:
+                // - live then synthetic
+                // - synthetic then live
+                // and always collapse repeated synthetic polls.
+                if is_synthetic || *seen_synthetic {
+                    if is_synthetic {
+                        *seen_synthetic = true;
+                    }
+                    return;
+                }
+            } else {
+                self.event_fingerprints.insert(fingerprint, is_synthetic);
                 self.event_fingerprint_order.push_back(fingerprint);
                 if self.event_fingerprint_order.len() > EVENT_FINGERPRINT_CACHE_CAPACITY
                     && let Some(evicted) = self.event_fingerprint_order.pop_front()
@@ -3361,6 +3371,22 @@ mod tests {
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.events.len(), 2);
+    }
+
+    #[test]
+    fn thread_event_store_dedupes_synthetic_then_live_same_fingerprint() {
+        let mut store = ThreadEventStore::new(16);
+        store.push_event(Event {
+            id: String::new(),
+            msg: EventMsg::SkillsUpdateAvailable,
+        });
+        store.push_event(Event {
+            id: "live-1".to_string(),
+            msg: EventMsg::SkillsUpdateAvailable,
+        });
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.events.len(), 1);
     }
 
     #[test]
