@@ -280,32 +280,31 @@ impl ThreadEventStore {
         store
     }
 
-    fn push_event(&mut self, event: Event) {
+    fn push_event(&mut self, event: Event) -> bool {
         match &event.msg {
             EventMsg::SessionConfigured(_) => {
                 self.session_configured = Some(event);
-                return;
+                return true;
             }
             EventMsg::ItemCompleted(completed) => {
                 if let TurnItem::UserMessage(item) = &completed.item {
                     if !event.id.is_empty() && self.user_message_ids.contains(&event.id) {
-                        return;
+                        return false;
                     }
                     let legacy = Event {
                         id: event.id,
                         msg: item.as_legacy_event(),
                     };
-                    self.push_legacy_event(legacy);
-                    return;
+                    return self.push_legacy_event(legacy);
                 }
             }
             _ => {}
         }
 
-        self.push_legacy_event(event);
+        self.push_legacy_event(event)
     }
 
-    fn push_legacy_event(&mut self, event: Event) {
+    fn push_legacy_event(&mut self, event: Event) -> bool {
         if let Some(fingerprint) = Self::event_fingerprint(&event.msg) {
             let is_synthetic = event.id.is_empty();
             if let Some(seen_synthetic) = self.event_fingerprints.get_mut(&fingerprint) {
@@ -318,7 +317,7 @@ impl ThreadEventStore {
                     if is_synthetic {
                         *seen_synthetic = true;
                     }
-                    return;
+                    return false;
                 }
             } else {
                 self.event_fingerprints.insert(fingerprint, is_synthetic);
@@ -335,7 +334,7 @@ impl ThreadEventStore {
             && !event.id.is_empty()
             && !self.user_message_ids.insert(event.id.clone())
         {
-            return;
+            return false;
         }
         self.buffer.push_back(event);
         if self.buffer.len() > self.capacity
@@ -345,6 +344,7 @@ impl ThreadEventStore {
         {
             self.user_message_ids.remove(&removed.id);
         }
+        true
     }
 
     fn event_fingerprint(msg: &EventMsg) -> Option<u64> {
@@ -874,8 +874,7 @@ impl App {
 
         let should_send = {
             let mut guard = store.lock().await;
-            guard.push_event(event.clone());
-            guard.active
+            guard.push_event(event.clone()) && guard.active
         };
 
         if should_send {
@@ -2945,8 +2944,7 @@ impl App {
                 };
                 let should_send = {
                     let mut guard = store.lock().await;
-                    guard.push_event(event.clone());
-                    guard.active
+                    guard.push_event(event.clone()) && guard.active
                 };
                 if should_send && let Err(err) = sender.send(event).await {
                     tracing::debug!("external thread {thread_id} channel closed: {err}");
@@ -3350,8 +3348,8 @@ mod tests {
             msg: EventMsg::SkillsUpdateAvailable,
         };
 
-        store.push_event(duplicate.clone());
-        store.push_event(duplicate);
+        assert!(store.push_event(duplicate.clone()));
+        assert!(!store.push_event(duplicate));
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.events.len(), 1);
@@ -3360,14 +3358,14 @@ mod tests {
     #[test]
     fn thread_event_store_keeps_duplicate_live_events_with_distinct_ids() {
         let mut store = ThreadEventStore::new(16);
-        store.push_event(Event {
+        assert!(store.push_event(Event {
             id: "live-1".to_string(),
             msg: EventMsg::SkillsUpdateAvailable,
-        });
-        store.push_event(Event {
+        }));
+        assert!(store.push_event(Event {
             id: "live-2".to_string(),
             msg: EventMsg::SkillsUpdateAvailable,
-        });
+        }));
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.events.len(), 2);
@@ -3376,14 +3374,14 @@ mod tests {
     #[test]
     fn thread_event_store_dedupes_synthetic_then_live_same_fingerprint() {
         let mut store = ThreadEventStore::new(16);
-        store.push_event(Event {
+        assert!(store.push_event(Event {
             id: String::new(),
             msg: EventMsg::SkillsUpdateAvailable,
-        });
-        store.push_event(Event {
+        }));
+        assert!(!store.push_event(Event {
             id: "live-1".to_string(),
             msg: EventMsg::SkillsUpdateAvailable,
-        });
+        }));
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.events.len(), 1);
@@ -3392,7 +3390,7 @@ mod tests {
     #[test]
     fn thread_event_store_dedupes_user_message_none_vs_empty_images() {
         let mut store = ThreadEventStore::new(16);
-        store.push_event(Event {
+        assert!(store.push_event(Event {
             id: "live-user-message".to_string(),
             msg: EventMsg::UserMessage(UserMessageEvent {
                 message: "hello".to_string(),
@@ -3400,8 +3398,8 @@ mod tests {
                 local_images: Vec::new(),
                 text_elements: Vec::new(),
             }),
-        });
-        store.push_event(Event {
+        }));
+        assert!(!store.push_event(Event {
             id: String::new(),
             msg: EventMsg::UserMessage(UserMessageEvent {
                 message: "hello".to_string(),
@@ -3409,7 +3407,7 @@ mod tests {
                 local_images: Vec::new(),
                 text_elements: Vec::new(),
             }),
-        });
+        }));
 
         let snapshot = store.snapshot();
         assert_eq!(snapshot.events.len(), 1);
