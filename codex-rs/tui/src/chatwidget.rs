@@ -4246,7 +4246,9 @@ impl ChatWidget {
                 }
             }
             EventMsg::UserMessage(ev) => {
-                if from_replay {
+                // Live rollout sync injects synthetic events with empty ids.
+                // Render those like replay events so cross-client user inputs show up.
+                if from_replay || id.as_deref().is_some_and(str::is_empty) {
                     self.on_user_message_event(ev);
                 }
             }

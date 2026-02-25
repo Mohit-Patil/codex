@@ -35,6 +35,7 @@ use codex_ansi_escape::ansi_escape_line;
 use codex_app_server_protocol::ConfigLayerSource;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
+use codex_core::RolloutRecorder;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core::config::ConfigBuilder;
@@ -83,6 +84,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::hash::Hash;
+use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,6 +105,8 @@ use toml::Value as TomlValue;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
+const EVENT_FINGERPRINT_CACHE_CAPACITY: usize = 8192;
+const ROLLOUT_LIVE_SYNC_INTERVAL: Duration = Duration::from_secs(2);
 /// Baseline cadence for periodic stream commit animation ticks.
 ///
 /// Smooth-mode streaming drains one line per tick, so this interval controls
@@ -248,6 +253,8 @@ struct ThreadEventStore {
     session_configured: Option<Event>,
     buffer: VecDeque<Event>,
     user_message_ids: HashSet<String>,
+    event_fingerprints: HashSet<u64>,
+    event_fingerprint_order: VecDeque<u64>,
     capacity: usize,
     active: bool,
 }
@@ -258,6 +265,8 @@ impl ThreadEventStore {
             session_configured: None,
             buffer: VecDeque::new(),
             user_message_ids: HashSet::new(),
+            event_fingerprints: HashSet::new(),
+            event_fingerprint_order: VecDeque::new(),
             capacity,
             active: false,
         }
@@ -295,6 +304,19 @@ impl ThreadEventStore {
     }
 
     fn push_legacy_event(&mut self, event: Event) {
+        if let Some(fingerprint) = Self::event_fingerprint(&event.msg) {
+            if self.event_fingerprints.contains(&fingerprint) {
+                return;
+            }
+            self.event_fingerprints.insert(fingerprint);
+            self.event_fingerprint_order.push_back(fingerprint);
+            if self.event_fingerprint_order.len() > EVENT_FINGERPRINT_CACHE_CAPACITY
+                && let Some(evicted) = self.event_fingerprint_order.pop_front()
+            {
+                self.event_fingerprints.remove(&evicted);
+            }
+        }
+
         if let EventMsg::UserMessage(_) = &event.msg
             && !event.id.is_empty()
             && !self.user_message_ids.insert(event.id.clone())
@@ -309,6 +331,13 @@ impl ThreadEventStore {
         {
             self.user_message_ids.remove(&removed.id);
         }
+    }
+
+    fn event_fingerprint(msg: &EventMsg) -> Option<u64> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let encoded = serde_json::to_vec(msg).ok()?;
+        encoded.hash(&mut hasher);
+        Some(hasher.finish())
     }
 
     fn snapshot(&self) -> ThreadEventSnapshot {
@@ -576,6 +605,7 @@ pub(crate) struct App {
     windows_sandbox: WindowsSandboxState,
 
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
+    rollout_live_sync_cursor: HashMap<ThreadId, usize>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<Event>>,
     primary_thread_id: Option<ThreadId>,
@@ -989,6 +1019,7 @@ impl App {
 
     fn reset_thread_event_state(&mut self) {
         self.thread_event_channels.clear();
+        self.rollout_live_sync_cursor.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
         self.primary_thread_id = None;
@@ -1021,6 +1052,59 @@ impl App {
         if self.backtrack_render_pending {
             tui.frame_requester().schedule_frame();
         }
+        Ok(())
+    }
+
+    async fn poll_rollout_live_updates(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        let Some(thread_id) = self.active_thread_id else {
+            return Ok(());
+        };
+        let Some(rollout_path) = self.chat_widget.rollout_path() else {
+            return Ok(());
+        };
+
+        let history = match RolloutRecorder::get_rollout_history(&rollout_path).await {
+            Ok(history) => history,
+            Err(err) => {
+                tracing::debug!(
+                    path = %rollout_path.display(),
+                    %err,
+                    "rollout live sync read failed"
+                );
+                return Ok(());
+            }
+        };
+        let Some(event_msgs) = history.get_event_msgs() else {
+            return Ok(());
+        };
+
+        let previous = *self
+            .rollout_live_sync_cursor
+            .entry(thread_id)
+            .or_insert(event_msgs.len());
+        if event_msgs.len() == previous {
+            return Ok(());
+        }
+
+        if event_msgs.len() < previous {
+            self.rollout_live_sync_cursor
+                .insert(thread_id, event_msgs.len());
+            return Ok(());
+        }
+
+        self.rollout_live_sync_cursor
+            .insert(thread_id, event_msgs.len());
+        for msg in event_msgs.into_iter().skip(previous) {
+            self.enqueue_thread_event(
+                thread_id,
+                Event {
+                    id: String::new(),
+                    msg,
+                },
+            )
+            .await?;
+        }
+        self.drain_active_thread_events(tui).await?;
         Ok(())
     }
 
@@ -1294,6 +1378,7 @@ impl App {
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
+            rollout_live_sync_cursor: HashMap::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -1356,6 +1441,7 @@ impl App {
         let mut thread_created_rx = thread_manager.subscribe_thread_created();
         let mut listen_for_threads = true;
         let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
+        let mut rollout_live_sync_tick = tokio::time::interval(ROLLOUT_LIVE_SYNC_INTERVAL);
 
         let exit_reason = loop {
             let control = select! {
@@ -1395,6 +1481,10 @@ impl App {
                             listen_for_threads = false;
                         }
                     }
+                    AppRunControl::Continue
+                }
+                _ = rollout_live_sync_tick.tick() => {
+                    app.poll_rollout_live_updates(tui).await?;
                     AppRunControl::Continue
                 }
             };
@@ -3226,6 +3316,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn thread_event_store_dedupes_duplicate_event_messages() {
+        let mut store = ThreadEventStore::new(16);
+        let duplicate = Event {
+            id: String::new(),
+            msg: EventMsg::SkillsUpdateAvailable,
+        };
+
+        store.push_event(duplicate.clone());
+        store.push_event(duplicate);
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.events.len(), 1);
+    }
+
     #[tokio::test]
     async fn enqueue_thread_event_does_not_block_when_channel_full() -> Result<()> {
         let mut app = make_test_app().await;
@@ -3548,6 +3653,7 @@ mod tests {
             pending_shutdown_exit_thread_id: None,
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
+            rollout_live_sync_cursor: HashMap::new(),
             active_thread_id: None,
             active_thread_rx: None,
             primary_thread_id: None,
@@ -3606,6 +3712,7 @@ mod tests {
                 pending_shutdown_exit_thread_id: None,
                 windows_sandbox: WindowsSandboxState::default(),
                 thread_event_channels: HashMap::new(),
+                rollout_live_sync_cursor: HashMap::new(),
                 active_thread_id: None,
                 active_thread_rx: None,
                 primary_thread_id: None,
